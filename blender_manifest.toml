@@ -1,0 +1,19 @@
+schema_version = "1.0.0"
+
+id = "hdr_to_png_encoder"
+version = "1.0.0"
+name = "HDR to PNG Encoder"
+tagline = "Encode .EXR/.HDR images to PNG in RGBM or dLDR format"
+maintainer = "Theanine3D <theanine3d@gmail.com>"
+
+type = "add-on"
+
+website = "https://github.com/theanine3D/hdr_to_png_encoder"
+
+tags = ["UV", "Material"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+copyright = ["2026 Pedro Valencia Oseguera"]
