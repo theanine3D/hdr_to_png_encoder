@@ -4,7 +4,7 @@
 
 HDR to PNG Encoder is a Blender 5.x addon that can convert an .HDR or .EXR image to a PNG with RGBM or dLDR encoding, for use in game engines like Unity.
 
-RGBM and dLDR encodings are used by game developers to reduce file size of lightmaps. RGBM can cut the file size of a HDR lightmap by at least half, and dLDR can cut it down even further (albeit with further lossiness.) You can read more about these encodings in [Unity's documentation](https://docs.unity3d.com/Manual/Lightmaps-TechnicalInformation.html).
+RGBM and dLDR encodings are used by game developers to reduce file size of lightmaps. RGBM will often cut the file size of a HDR lightmap by at least half, and dLDR can cut it down even further (albeit with further lossiness.) You can read more about these encodings in [Unity's documentation](https://docs.unity3d.com/Manual/Lightmaps-TechnicalInformation.html).
 
 Finding this addon useful? Please consider starring it ⭐, or [donating](https://ko-fi.com/theanine3d) 🙂<br>
 
