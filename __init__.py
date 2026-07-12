@@ -3,7 +3,7 @@ bl_info = {
     "author": "Theanine3D",
     "version": (1, 3, 0),
     "blender": (5, 0, 0),
-    "location": "UV/Image Editor > Sidebar (N) > HDR Tools",
+    "location": "UV/Image Editor > Sidebar (N) > HDR Encoding (image tools); 3D Viewport > Sidebar (N) > HDR Encoding (vertex color tools)",
     "description": "Tools for encoding / compressing HDR images and vertex colors, for use in game engines",
     "category": "UV",
 }
@@ -13,8 +13,8 @@ from collections import deque
 
 import bpy
 import numpy as np
-from bpy.props import (EnumProperty, FloatProperty, PointerProperty,
-                       StringProperty)
+from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
+                       PointerProperty, StringProperty)
 from bpy.types import Operator, Panel, PropertyGroup
 from bpy_extras.io_utils import ImportHelper
 
@@ -290,6 +290,152 @@ def find_buried_islands(mesh, attr, threshold):
                     seen[nb] = True
                     queue.append(nb)
     return mask, islands
+
+
+def mesh_islands(mesh, adj):
+    """Label every vertex with a connected-component (geometry island)
+    id. Returns (island_id array, island count)."""
+    n_verts = len(mesh.vertices)
+    island_id = -np.ones(n_verts, dtype=np.int64)
+    n_islands = 0
+    for v0 in range(n_verts):
+        if island_id[v0] != -1:
+            continue
+        island_id[v0] = n_islands
+        queue = deque([v0])
+        while queue:
+            v = queue.popleft()
+            for nb in adj[v]:
+                if island_id[nb] == -1:
+                    island_id[nb] = n_islands
+                    queue.append(nb)
+        n_islands += 1
+    return island_id, n_islands
+
+
+def sample_buried_islands_from_other_islands(mesh, attr, threshold,
+                                              min_similarity):
+    """For every face on a fully buried geometry island (a connected
+    component with zero vertices above the darkness threshold, so
+    fix_buried_vertices has no brighter vertex in it to copy from), find
+    the nearest face - by face-center distance - on a different,
+    non-buried island whose normal points in a similar direction
+    (cosine similarity >= min_similarity), and copy that donor face's
+    averaged corner color onto every vertex/corner of the buried face.
+    A buried face with no donor above the similarity threshold anywhere
+    in the mesh is left unchanged. Returns the number of vertices whose
+    color was set this way."""
+    n_verts = len(mesh.vertices)
+    n_polys = len(mesh.polygons)
+    if n_verts == 0 or n_polys == 0:
+        return 0
+
+    state = burial_state(mesh, attr, threshold)
+    if state is None:
+        return 0
+    buf, rgba, loop_v_state, source, target, vert_color = state
+    if not target.any():
+        return 0
+
+    if attr.domain == 'CORNER':
+        loop_v = loop_v_state
+    else:
+        loop_v = np.empty(len(mesh.loops), dtype=np.int64)
+        mesh.loops.foreach_get("vertex_index", loop_v)
+
+    adj = vertex_adjacency(mesh)
+    island_id, n_islands = mesh_islands(mesh, adj)
+    island_has_source = np.zeros(n_islands, dtype=bool)
+    np.logical_or.at(island_has_source, island_id, source)
+
+    loop_start = np.empty(n_polys, dtype=np.int64)
+    mesh.polygons.foreach_get("loop_start", loop_start)
+    loop_total = np.empty(n_polys, dtype=np.int64)
+    mesh.polygons.foreach_get("loop_total", loop_total)
+    poly_island = island_id[loop_v[loop_start]]
+
+    # After fix_buried_vertices, any island with a source vertex has
+    # already been fully repaired, so remaining dark faces belong
+    # exclusively to zero-source islands - and every other face is a
+    # safe, genuinely-lit donor candidate.
+    buried_face_mask = ~island_has_source[poly_island]
+    donor_face_mask = island_has_source[poly_island]
+    if not buried_face_mask.any() or not donor_face_mask.any():
+        return 0
+
+    normals = np.empty(n_polys * 3, dtype=np.float32)
+    mesh.polygons.foreach_get("normal", normals)
+    normals = normals.reshape(-1, 3)
+    centers = np.empty(n_polys * 3, dtype=np.float32)
+    mesh.polygons.foreach_get("center", centers)
+    centers = centers.reshape(-1, 3)
+
+    corner_color = rgba[:, :3] if attr.domain == 'CORNER' \
+        else vert_color[loop_v]
+    poly_color = (np.add.reduceat(corner_color, loop_start, axis=0)
+                 / loop_total[:, None])
+
+    donor_idx = np.flatnonzero(donor_face_mask)
+    target_idx = np.flatnonzero(buried_face_mask)
+    donor_normals = normals[donor_idx]
+    donor_centers = centers[donor_idx]
+    donor_colors = poly_color[donor_idx]
+
+    # Nearest-donor search, chunked on both axes so memory stays bounded
+    # regardless of mesh size (this is a brute-force O(targets*donors)
+    # search - fine for the modest face counts a "buried island" repair
+    # pass typically involves, but can get slow on very large scenes
+    # with many buried faces).
+    best_dist2 = np.full(target_idx.size, np.inf, dtype=np.float64)
+    best_donor = np.full(target_idx.size, -1, dtype=np.int64)
+    TARGET_CHUNK = 500
+    DONOR_CHUNK = 4000
+    for ts in range(0, target_idx.size, TARGET_CHUNK):
+        te = min(ts + TARGET_CHUNK, target_idx.size)
+        t_normals = normals[target_idx[ts:te]]
+        t_centers = centers[target_idx[ts:te]]
+        chunk_best_dist2 = best_dist2[ts:te]
+        chunk_best_donor = best_donor[ts:te]
+        for ds in range(0, donor_idx.size, DONOR_CHUNK):
+            de = min(ds + DONOR_CHUNK, donor_idx.size)
+            sim = t_normals @ donor_normals[ds:de].T          # (T, D)
+            diff = t_centers[:, None, :] - donor_centers[None, ds:de, :]
+            dist2 = np.einsum('tdj,tdj->td', diff, diff)
+            dist2[sim < min_similarity] = np.inf
+            local_best = np.argmin(dist2, axis=1)
+            local_best_dist2 = dist2[np.arange(dist2.shape[0]), local_best]
+            better = local_best_dist2 < chunk_best_dist2
+            chunk_best_dist2[better] = local_best_dist2[better]
+            chunk_best_donor[better] = ds + local_best[better]
+        best_dist2[ts:te] = chunk_best_dist2
+        best_donor[ts:te] = chunk_best_donor
+
+    matched = best_donor >= 0
+    if not matched.any():
+        return 0
+
+    matched_target_polys = target_idx[matched]
+    matched_colors = donor_colors[best_donor[matched]]
+
+    updated_verts = set()
+    for poly_i, color in zip(matched_target_polys, matched_colors):
+        ls = loop_start[poly_i]
+        lt = loop_total[poly_i]
+        if attr.domain == 'CORNER':
+            rgba[ls:ls + lt, :3] = color
+        else:
+            vs = loop_v[ls:ls + lt]
+            rgba[vs, :3] = color
+            updated_verts.update(vs.tolist())
+    attr.data.foreach_set("color", buf)
+
+    if attr.domain == 'CORNER':
+        for poly_i in matched_target_polys:
+            ls = loop_start[poly_i]
+            lt = loop_total[poly_i]
+            updated_verts.update(loop_v[ls:ls + lt].tolist())
+
+    return len(updated_verts)
 
 
 def select_only_vertices(mesh, vert_mask):
@@ -727,6 +873,28 @@ class HDRENC_OT_fix_buried_vcol(Operator):
     bl_label = "Fix Buried Vertices"
     bl_options = {'REGISTER', 'UNDO'}
 
+    sample_from_other_islands: BoolProperty(
+        name="Sample from Other Islands",
+        description="For geometry islands that are 100% buried (no "
+                    "vertex above the Darkness Threshold to copy from, "
+                    "so they'd otherwise be left dark), copy colors "
+                    "from the nearest face on a different island whose "
+                    "normal points in a similar direction",
+        default=False,
+    )
+    normal_similarity: FloatProperty(
+        name="Normal Similarity",
+        description="How closely a donor face's normal must match the "
+                    "buried face's normal to be used, for Sample from "
+                    "Other Islands (100% = facing exactly the same "
+                    "direction)",
+        min=0.0,
+        max=100.0,
+        default=99.0,
+        subtype='PERCENTAGE',
+        precision=1,
+    )
+
     @classmethod
     def poll(cls, context):
         return (context.mode == 'OBJECT'
@@ -736,35 +904,52 @@ class HDRENC_OT_fix_buried_vcol(Operator):
         threshold = context.scene.hdr_encode.darkness_threshold
         fixed = 0
         unreachable = 0
+        sampled = 0
         meshes = 0
         for obj, mesh in selected_unique_meshes(context):
             attr = mesh.color_attributes.active_color
             if attr is None:
                 continue
             f, u = fix_buried_vertices(mesh, attr, threshold)
-            mesh.update()
             meshes += 1
             fixed += f
             unreachable += u
+            if self.sample_from_other_islands and u:
+                sampled += sample_buried_islands_from_other_islands(
+                    mesh, attr, threshold, self.normal_similarity / 100.0)
+            mesh.update()
 
         if meshes == 0:
             self.report({'WARNING'},
                         "Selected meshes have no color attributes")
             return {'CANCELLED'}
+        remaining = unreachable - sampled
         if fixed == 0 and unreachable == 0:
             self.report({'INFO'},
                         "No buried vertices found on %d mesh(es) "
                         "(threshold %.4f)" % (meshes, threshold))
-        elif unreachable:
+        elif not self.sample_from_other_islands:
+            if unreachable:
+                self.report({'WARNING'},
+                            "Fixed %d buried vertex(es) on %d mesh(es); "
+                            "%d left dark (not connected to any vertex "
+                            "above the threshold)"
+                            % (fixed, meshes, unreachable))
+            else:
+                self.report({'INFO'},
+                            "Fixed %d buried vertex(es) on %d mesh(es)"
+                            % (fixed, meshes))
+        elif remaining:
             self.report({'WARNING'},
-                        "Fixed %d buried vertex(es) on %d mesh(es); "
-                        "%d left dark (not connected to any vertex "
-                        "above the threshold)"
-                        % (fixed, meshes, unreachable))
+                        "Fixed %d buried vertex(es) and sampled %d more "
+                        "from other islands on %d mesh(es); %d still "
+                        "left dark (no similar-facing donor found)"
+                        % (fixed, sampled, meshes, remaining))
         else:
             self.report({'INFO'},
-                        "Fixed %d buried vertex(es) on %d mesh(es)"
-                        % (fixed, meshes))
+                        "Fixed %d buried vertex(es) and sampled %d more "
+                        "from other islands on %d mesh(es)"
+                        % (fixed, sampled, meshes))
         return {'FINISHED'}
 
 
@@ -863,12 +1048,10 @@ class HDRENC_PT_batch(Panel):
 
 class HDRENC_PT_vertex_colors(Panel):
     bl_idname = "HDRENC_PT_vertex_colors"
-    bl_space_type = 'IMAGE_EDITOR'
+    bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "HDR Encoding"
-    bl_parent_id = "HDRENC_PT_panel"
     bl_label = "Vertex Colors"
-    bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
         layout = self.layout
