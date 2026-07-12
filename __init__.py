@@ -595,9 +595,7 @@ class HDRENC_OT_fix_buried_vcol(Operator):
 
 
 class HDRENC_OT_smooth_vcol(Operator):
-    """Run Blender's built-in Smooth Vertex Colors on the active color
-    attribute of every selected mesh (the built-in operator only works
-    on one object at a time)"""
+    """Run Blender's built-in 'Smooth Vertex Colors' feature in batch mode - on all selected mesh objects. Only the active color attribute of each mesh is affected"""
     bl_idname = "hdrenc.smooth_vcol"
     bl_label = "Smooth Vertex Colors"
     bl_options = {'REGISTER', 'UNDO'}
