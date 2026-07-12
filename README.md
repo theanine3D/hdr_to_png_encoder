@@ -1,6 +1,6 @@
 # HDR Encoding Tools
 
-<img width="241" height="459" alt="image" src="https://github.com/user-attachments/assets/b417ce5b-51f5-4710-a2c9-94d50ddb4b24" />
+<img width="241" height="235" alt="image" src="https://github.com/user-attachments/assets/bf0a787d-088a-4c2e-9a95-9b61777245b8" />
 
 HDR Encoding Tools is a Blender 5.x addon that can prepare baked HDR light for use in game engines like Unity. It can convert an .HDR or .EXR image to a PNG with RGBM or dLDR encoding. It can also compress and clean up HDR vertex colors.
 
@@ -59,12 +59,13 @@ compressed into range first.
 
 Typical workflow:
 
-1. Select your meshes, press **Create Vertex Color Layer**
-2. Bake lighting to the color attribute (Cycles: Bake target →
+1.  Open the "HDR Encoding" tab on the righthand sidebar of the 3D Viewport.
+2. Select your meshes, press **Create Vertex Color Layer**
+3. Bake lighting to the color attribute (Cycles: Bake target →
    Active Color Attribute)
-3. Press **Compress HDR Vertex Color**
-4. Export FBX (Geometry → Vertex Colors enabled)
-5. In your Unity or Unreal shader, multiply the vertex color by the same factor
+4. Press **Compress HDR Vertex Color**
+5. Export FBX (Geometry → Vertex Colors enabled)
+6. In your Unity or Unreal shader, multiply the vertex color by the same factor
    to restore the HDR intensity
 
 Keep the compressed values if you plan to re-export; use **Decompress
