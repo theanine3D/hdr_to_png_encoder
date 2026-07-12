@@ -1,6 +1,7 @@
 # HDR Encoding Tools
 
-<img width="241" height="235" alt="image" src="https://github.com/user-attachments/assets/bf0a787d-088a-4c2e-9a95-9b61777245b8" />
+<img width="241" height="235" alt="image" src="https://github.com/user-attachments/assets/bf0a787d-088a-4c2e-9a95-9b61777245b8" /><img width="241" height="244" alt="image" src="https://github.com/user-attachments/assets/dffd40f0-065f-49a2-8cdb-c7f97232d9e9" />
+
 
 HDR Encoding Tools is a Blender 5.x addon that can prepare baked HDR light for use in game engines like Unity. It can convert an .HDR or .EXR image to a PNG with RGBM or dLDR encoding. It can also compress and clean up HDR vertex colors.
 
