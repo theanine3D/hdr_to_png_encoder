@@ -154,34 +154,36 @@ def convert_color_attribute_type(context, obj, data_type):
     return converted
 
 
-def fix_buried_vertices(mesh, attr, threshold):
-    """Replace the color of every buried vertex — one whose RGB channels
-    are all at or below the darkness threshold — with the color of the
-    nearest connected non-buried vertex (breadth-first over mesh edges,
-    so a whole dark patch is filled from its border inward).
-    Works on both Vertex and Face Corner domains; alpha is untouched.
-    Returns (fixed, unreachable) vertex counts."""
+def burial_state(mesh, attr, threshold):
+    """Classify every vertex of a color attribute by burial state.
+
+    Returns (buf, rgba, loop_v, source, target, vert_color), or None if
+    the mesh or attribute has no data. source marks vertices with at
+    least one corner brighter than the threshold (vert_color holds their
+    representative color); target marks buried vertices, whose color
+    data is entirely at or below the threshold. loop_v is None for
+    Vertex-domain attributes."""
     count = len(attr.data)
     n_verts = len(mesh.vertices)
     if count == 0 or n_verts == 0:
-        return 0, 0
+        return None
 
     buf = np.empty(count * 4, dtype=np.float32)
     attr.data.foreach_get("color", buf)
     rgba = buf.reshape(-1, 4)
 
+    loop_v = None
     if attr.domain == 'CORNER':
         loop_v = np.empty(len(mesh.loops), dtype=np.int64)
         mesh.loops.foreach_get("vertex_index", loop_v)
-        corner_nonblack = rgba[:, :3].max(axis=1) > threshold
+        corner_bright = rgba[:, :3].max(axis=1) > threshold
         # A vertex is buried only if every one of its corners is dark.
         # A non-buried vertex's replacement color averages only its
         # non-dark corners, so seam vertices don't contribute darkness.
         col_sum = np.zeros((n_verts, 3), dtype=np.float64)
         col_cnt = np.zeros(n_verts, dtype=np.int64)
-        np.add.at(col_sum, loop_v[corner_nonblack],
-                  rgba[corner_nonblack, :3])
-        np.add.at(col_cnt, loop_v[corner_nonblack], 1)
+        np.add.at(col_sum, loop_v[corner_bright], rgba[corner_bright, :3])
+        np.add.at(col_cnt, loop_v[corner_bright], 1)
         has_corner = np.zeros(n_verts, dtype=bool)
         has_corner[loop_v] = True
         source = col_cnt > 0
@@ -193,20 +195,39 @@ def fix_buried_vertices(mesh, attr, threshold):
         vert_color = rgba[:, :3].copy()
         source = vert_color.max(axis=1) > threshold
         target = ~source
+    return buf, rgba, loop_v, source, target, vert_color
+
+
+def vertex_adjacency(mesh):
+    """Vertex adjacency lists built from the mesh's edges."""
+    adj = [[] for _ in range(len(mesh.vertices))]
+    edge_v = np.empty(len(mesh.edges) * 2, dtype=np.int64)
+    mesh.edges.foreach_get("vertices", edge_v)
+    for a, b in edge_v.reshape(-1, 2):
+        adj[a].append(b)
+        adj[b].append(a)
+    return adj
+
+
+def fix_buried_vertices(mesh, attr, threshold):
+    """Replace the color of every buried vertex — one whose RGB channels
+    are all at or below the darkness threshold — with the color of the
+    nearest connected non-buried vertex (breadth-first over mesh edges,
+    so a whole dark patch is filled from its border inward).
+    Works on both Vertex and Face Corner domains; alpha is untouched.
+    Returns (fixed, unreachable) vertex counts."""
+    state = burial_state(mesh, attr, threshold)
+    if state is None:
+        return 0, 0
+    buf, rgba, loop_v, source, target, vert_color = state
 
     if not target.any() or not source.any():
         return 0, int(np.count_nonzero(target))
 
-    edge_v = np.empty(len(mesh.edges) * 2, dtype=np.int64)
-    mesh.edges.foreach_get("vertices", edge_v)
-    adj = [[] for _ in range(n_verts)]
-    for a, b in edge_v.reshape(-1, 2):
-        adj[a].append(b)
-        adj[b].append(a)
-
+    adj = vertex_adjacency(mesh)
     filled = source.copy()
     queue = deque(np.flatnonzero(source).tolist())
-    fixed_mask = np.zeros(n_verts, dtype=bool)
+    fixed_mask = np.zeros(len(mesh.vertices), dtype=bool)
     while queue:
         v = queue.popleft()
         for nb in adj[v]:
@@ -227,6 +248,69 @@ def fix_buried_vertices(mesh, attr, threshold):
             rgba[fixed_mask, :3] = vert_color[fixed_mask]
         attr.data.foreach_set("color", buf)
     return fixed, unreachable
+
+
+def find_buried_islands(mesh, attr, threshold):
+    """Find the vertices Fix Buried Vertices cannot repair: whole
+    geometry islands where no vertex rises above the darkness threshold,
+    so there is no brighter vertex to copy a color from.
+    Returns (vertex mask, island count)."""
+    n_verts = len(mesh.vertices)
+    state = burial_state(mesh, attr, threshold)
+    if state is None:
+        return np.zeros(n_verts, dtype=bool), 0
+    source = state[3]
+    target = state[4]
+    if not target.any():
+        return np.zeros(n_verts, dtype=bool), 0
+
+    adj = vertex_adjacency(mesh)
+    filled = source.copy()
+    queue = deque(np.flatnonzero(source).tolist())
+    while queue:
+        v = queue.popleft()
+        for nb in adj[v]:
+            if not filled[nb]:
+                filled[nb] = True
+                queue.append(nb)
+    mask = ~filled  # islands containing no source vertex at all
+
+    islands = 0
+    seen = np.zeros(n_verts, dtype=bool)
+    for v0 in np.flatnonzero(mask):
+        if seen[v0]:
+            continue
+        islands += 1
+        seen[v0] = True
+        queue = deque([v0])
+        while queue:
+            v = queue.popleft()
+            for nb in adj[v]:
+                if mask[nb] and not seen[nb]:
+                    seen[nb] = True
+                    queue.append(nb)
+    return mask, islands
+
+
+def select_only_vertices(mesh, vert_mask):
+    """Replace the mesh's selection with exactly vert_mask, flushing
+    vertex selection to edges and faces."""
+    mesh.vertices.foreach_set("select", vert_mask)
+    n_edges = len(mesh.edges)
+    if n_edges:
+        edge_v = np.empty(n_edges * 2, dtype=np.int64)
+        mesh.edges.foreach_get("vertices", edge_v)
+        edge_sel = vert_mask[edge_v.reshape(-1, 2)].all(axis=1)
+        mesh.edges.foreach_set("select", edge_sel)
+    n_polys = len(mesh.polygons)
+    if n_polys:
+        loop_v = np.empty(len(mesh.loops), dtype=np.int64)
+        mesh.loops.foreach_get("vertex_index", loop_v)
+        loop_start = np.empty(n_polys, dtype=np.int64)
+        mesh.polygons.foreach_get("loop_start", loop_start)
+        face_sel = np.logical_and.reduceat(vert_mask[loop_v], loop_start)
+        mesh.polygons.foreach_set("select", face_sel)
+    mesh.update()
 
 
 class HDRENC_props(PropertyGroup):
@@ -555,6 +639,68 @@ class HDRENC_OT_decompress_vcol(Operator):
         return {'FINISHED'}
 
 
+class HDRENC_OT_find_buried_islands(Operator):
+    """Select every geometry island that is 100% buried — no vertex in
+    it above the Darkness Threshold — and switch to Edit Mode so the
+    islands are highlighted. These are the islands Fix Buried Vertices
+    cannot repair, because there is no brighter vertex to copy from"""
+    bl_idname = "hdrenc.find_buried_islands"
+    bl_label = "Find Buried Islands"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.mode == 'OBJECT'
+                and any(o.type == 'MESH' for o in context.selected_objects))
+
+    def execute(self, context):
+        threshold = context.scene.hdr_encode.darkness_threshold
+        meshes = 0
+        verts_found = 0
+        islands_found = 0
+        first_hit_obj = None
+        hit_objects = []
+        for obj, mesh in selected_unique_meshes(context):
+            attr = mesh.color_attributes.active_color
+            if attr is None:
+                continue
+            meshes += 1
+            mask, islands = find_buried_islands(mesh, attr, threshold)
+            select_only_vertices(mesh, mask)
+            found = int(np.count_nonzero(mask))
+            verts_found += found
+            islands_found += islands
+            if found:
+                hit_objects.append(obj.name)
+                if first_hit_obj is None:
+                    first_hit_obj = obj
+
+        if meshes == 0:
+            self.report({'WARNING'},
+                        "Selected meshes have no color attributes")
+            return {'CANCELLED'}
+        if verts_found == 0:
+            self.report({'INFO'},
+                        "No fully buried islands found on %d mesh(es) "
+                        "(threshold %.4f)" % (meshes, threshold))
+            return {'FINISHED'}
+
+        context.view_layer.objects.active = first_hit_obj
+        context.tool_settings.mesh_select_mode = (True, False, False)
+        try:
+            bpy.ops.object.mode_set(mode='EDIT')
+        except RuntimeError as ex:
+            self.report({'WARNING'},
+                        "Islands selected, but could not enter Edit "
+                        "Mode: %s" % ex)
+            return {'FINISHED'}
+
+        self.report({'INFO'},
+                    "Selected %d buried island(s) (%d vertices) on: %s"
+                    % (islands_found, verts_found, ", ".join(hit_objects)))
+        return {'FINISHED'}
+
+
 class HDRENC_OT_fix_buried_vcol(Operator):
     """Fixes the dark shadow bleed caused by vertices that were buried slightly in the ground or inside other objects during the light bake"""
     bl_idname = "hdrenc.fix_buried_vcol"
@@ -721,6 +867,8 @@ class HDRENC_PT_vertex_colors(Panel):
         col = layout.column(align=True)
         col.label(text="Cleanup:")
         col.prop(props, "darkness_threshold", slider=True)
+        col.operator(HDRENC_OT_find_buried_islands.bl_idname,
+                     icon='VIEWZOOM')
         col.operator(HDRENC_OT_fix_buried_vcol.bl_idname,
                      icon='SHADING_SOLID')
         col.operator(HDRENC_OT_smooth_vcol.bl_idname, icon='MOD_SMOOTH')
@@ -734,6 +882,7 @@ classes = (
     HDRENC_OT_create_vcol,
     HDRENC_OT_compress_vcol,
     HDRENC_OT_decompress_vcol,
+    HDRENC_OT_find_buried_islands,
     HDRENC_OT_fix_buried_vcol,
     HDRENC_OT_smooth_vcol,
     HDRENC_PT_panel,
