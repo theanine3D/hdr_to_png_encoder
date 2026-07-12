@@ -1,14 +1,14 @@
 schema_version = "1.0.0"
 
-id = "hdr_to_png_encoder"
-version = "1.0.0"
-name = "HDR to PNG Encoder"
-tagline = "Encode .EXR/.HDR images to PNG in RGBM or dLDR format"
+id = "hdr_encoding_tools"
+version = "1.2.0"
+name = "HDR Encoding Tools"
+tagline = "Tools for encoding/compressing HDR images & vertex colors"
 maintainer = "Theanine3D <theanine3d@gmail.com>"
 
 type = "add-on"
 
-website = "https://github.com/theanine3D/hdr_to_png_encoder"
+website = "https://github.com/theanine3D/hdr_encoding_tools"
 
 tags = ["UV", "Material"]
 
