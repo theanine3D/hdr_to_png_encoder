@@ -76,15 +76,19 @@ values in Blender. Alpha is never scaled — only RGB.
 HDR Encoding Tools also has some cleanup features for light that was baked to
 vertex colors. 
 
-- **Fix Black Vertices** — repairs "shadow bleed": if vertices at the
-  base of a mesh poke even slightly below the ground, they bake to solid
-  black, and interpolation then smears that black up the sides of the
-  mesh. This button finds every solid black (#000000) vertex and copies
-  the color of the nearest connected non-black vertex, searching outward
-  through connected vertices until it finds one that isn't black. Works
-  on both Vertex and Face Corner domains; alpha is never touched.
-  Vertices in a fully black disconnected island (no non-black vertex to
-  reach) are left as-is and counted in the report.
+- **Fix Buried Vertices** — repairs "shadow bleed": if vertices at the
+  base of a mesh poke even slightly below the ground, they bake to
+  black or near-black, and interpolation then smears that darkness up
+  the sides of the mesh. This button finds every buried vertex — one
+  whose RGB channels are all at or below the **Darkness Threshold**
+  (default 0.003) — and copies the color of the nearest connected
+  non-buried vertex, searching outward through connected vertices until
+  it finds one above the threshold. Raise the threshold if your buried
+  vertices bake slightly brighter than that; lower it if legitimate
+  dark areas are being caught. Works on both Vertex and Face Corner
+  domains; alpha is never touched. Vertices in a fully dark
+  disconnected island (no bright vertex to reach) are left as-is and
+  counted in the report.
 - **Smooth Vertex Colors** — runs Blender's built-in Smooth Vertex
   Colors feature (from Vertex Color Paint mode) in batch mode on every
   selected mesh in one click.
