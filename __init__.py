@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "HDR to PNG Encoder",
+    "name": "HDR Encoding Tools",
     "author": "Theanine3D",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (5, 0, 0),
-    "location": "UV/Image Editor > Sidebar (N) > HDR Encode",
-    "description": "Encode .exr/.hdr images to RGBM or dLDR PNG (Unity lightmap encodings)",
+    "location": "UV/Image Editor > Sidebar (N) > HDR Tools",
+    "description": "Tools for encoding / compressing HDR images and vertex colors, for use in game engines",
     "category": "UV",
 }
 
@@ -12,7 +12,8 @@ import os
 
 import bpy
 import numpy as np
-from bpy.props import EnumProperty, PointerProperty, StringProperty
+from bpy.props import (EnumProperty, FloatProperty, PointerProperty,
+                       StringProperty)
 from bpy.types import Operator, Panel, PropertyGroup
 from bpy_extras.io_utils import ImportHelper
 
@@ -95,6 +96,63 @@ def convert_hdr_file(src_path, encoding):
     return img
 
 
+def selected_unique_meshes(context):
+    """Yield one (object, mesh) pair per unique editable mesh in the
+    selection, so multi-user meshes are only processed once."""
+    seen = set()
+    for obj in context.selected_objects:
+        if obj.type != 'MESH':
+            continue
+        mesh = obj.data
+        if mesh.library is not None or mesh.name in seen:
+            continue
+        seen.add(mesh.name)
+        yield obj, mesh
+
+
+def scale_color_attribute(attr, factor):
+    """Multiply the RGB of every element of a color attribute; alpha
+    is left untouched."""
+    count = len(attr.data)
+    if count == 0:
+        return
+    buf = np.empty(count * 4, dtype=np.float32)
+    attr.data.foreach_get("color", buf)
+    rgba = buf.reshape(-1, 4)
+    rgba[:, :3] *= factor
+    attr.data.foreach_set("color", buf)
+
+
+def convert_color_attribute_type(context, obj, data_type):
+    """Convert every color attribute on obj's mesh to Face Corner domain
+    and the given data type. Domain is always forced to Face Corner
+    (Unity's FBX import expects it); only the data type toggles between
+    compress and decompress. Returns the number of layers now in that
+    format."""
+    mesh = obj.data
+    names = [a.name for a in mesh.color_attributes]
+    converted = 0
+    view_layer = context.view_layer
+    prev_active = view_layer.objects.active
+    view_layer.objects.active = obj
+    try:
+        for name in names:
+            idx = mesh.color_attributes.find(name)
+            if idx < 0:
+                continue
+            attr = mesh.color_attributes[idx]
+            if attr.domain == 'CORNER' and attr.data_type == data_type:
+                converted += 1
+                continue
+            mesh.color_attributes.active_color_index = idx
+            bpy.ops.geometry.color_attribute_convert(
+                domain='CORNER', data_type=data_type)
+            converted += 1
+    finally:
+        view_layer.objects.active = prev_active
+    return converted
+
+
 class HDRENC_props(PropertyGroup):
     source_path: StringProperty(
         name="Source Image",
@@ -116,6 +174,15 @@ class HDRENC_props(PropertyGroup):
         name="Batch Folder",
         description="Folder whose .exr/.hdr files will all be converted",
         subtype='DIR_PATH',
+    )
+    compression_factor: FloatProperty(
+        name="Compression Factor",
+        description="Vertex colors are divided by this before FBX export "
+                    "and multiplied by it (here or in a Unity shader) to "
+                    "restore the HDR range",
+        min=2.0,
+        max=6.0,
+        default=4.0,
     )
 
 
@@ -282,12 +349,122 @@ class HDRENC_OT_batch_convert(Operator):
                         % (self._converted, self._folder))
 
 
+class HDRENC_OT_create_vcol(Operator):
+    """Ensure every selected mesh has at least one color attribute
+    (Face Corner domain, Color data type). Meshes that already have
+    one are left untouched"""
+    bl_idname = "hdrenc.create_vcol"
+    bl_label = "Create Vertex Color Layer"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.mode == 'OBJECT'
+                and any(o.type == 'MESH' for o in context.selected_objects))
+
+    def execute(self, context):
+        created = 0
+        skipped = 0
+        for obj, mesh in selected_unique_meshes(context):
+            if mesh.color_attributes:
+                skipped += 1
+                continue
+            attr = mesh.color_attributes.new("Color", 'FLOAT_COLOR', 'CORNER')
+            mesh.color_attributes.active_color = attr
+            created += 1
+
+        if created == 0 and skipped == 0:
+            self.report({'WARNING'}, "No mesh objects selected")
+            return {'CANCELLED'}
+        self.report({'INFO'},
+                    "Created a vertex color layer on %d mesh(es); "
+                    "%d already had one" % (created, skipped))
+        return {'FINISHED'}
+
+
+class HDRENC_OT_compress_vcol(Operator):
+    """Divide vertex colors by the compression factor, then convert all
+    color attributes to Face Corner domain / Byte Color data type (the
+    only format Unity imports from FBX)"""
+    bl_idname = "hdrenc.compress_vcol"
+    bl_label = "Compress HDR Vertex Color"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.mode == 'OBJECT'
+                and any(o.type == 'MESH' for o in context.selected_objects))
+
+    def execute(self, context):
+        factor = context.scene.hdr_encode.compression_factor
+        layers = 0
+        meshes = 0
+        for obj, mesh in selected_unique_meshes(context):
+            if not mesh.color_attributes:
+                continue
+            # Scale while the data is still float so HDR values survive
+            for attr in mesh.color_attributes:
+                scale_color_attribute(attr, 1.0 / factor)
+            layers += convert_color_attribute_type(context, obj, 'BYTE_COLOR')
+            mesh.update()
+            meshes += 1
+
+        if meshes == 0:
+            self.report({'WARNING'},
+                        "Selected meshes have no color attributes")
+            return {'CANCELLED'}
+        self.report({'INFO'},
+                    "Compressed %d color layer(s) on %d mesh(es) "
+                    "(divided by %g, now Face Corner / Byte Color)"
+                    % (layers, meshes, factor))
+        return {'FINISHED'}
+
+
+class HDRENC_OT_decompress_vcol(Operator):
+    """Convert all color attributes to Face Corner domain / Color (float)
+    data type, then multiply vertex colors by the compression factor to
+    restore the HDR range"""
+    bl_idname = "hdrenc.decompress_vcol"
+    bl_label = "Decompress and Restore HDR"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.mode == 'OBJECT'
+                and any(o.type == 'MESH' for o in context.selected_objects))
+
+    def execute(self, context):
+        factor = context.scene.hdr_encode.compression_factor
+        layers = 0
+        meshes = 0
+        for obj, mesh in selected_unique_meshes(context):
+            if not mesh.color_attributes:
+                continue
+            # Convert to float first so the multiply isn't clamped to 1
+            layers += convert_color_attribute_type(
+                context, obj, 'FLOAT_COLOR')
+            for attr in mesh.color_attributes:
+                scale_color_attribute(attr, factor)
+            mesh.update()
+            meshes += 1
+
+        if meshes == 0:
+            self.report({'WARNING'},
+                        "Selected meshes have no color attributes")
+            return {'CANCELLED'}
+        self.report({'INFO'},
+                    "Restored %d color layer(s) on %d mesh(es) "
+                    "(multiplied by %g, now Face Corner / Color)"
+                    % (layers, meshes, factor))
+        return {'FINISHED'}
+
+
 class HDRENC_PT_panel(Panel):
     bl_idname = "HDRENC_PT_panel"
     bl_space_type = 'IMAGE_EDITOR'
     bl_region_type = 'UI'
-    bl_category = "HDR Encode"
-    bl_label = "RGBM / dLDR Encoder"
+    bl_category = "HDR Encoding"
+    bl_label = "HDR Encoding Tools"
 
     def draw(self, context):
         layout = self.layout
@@ -323,13 +500,41 @@ class HDRENC_PT_batch(Panel):
         layout.operator(HDRENC_OT_batch_convert.bl_idname, icon='FILE_FOLDER')
 
 
+class HDRENC_PT_vertex_colors(Panel):
+    bl_idname = "HDRENC_PT_vertex_colors"
+    bl_space_type = 'IMAGE_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = "HDR Encode"
+    bl_parent_id = "HDRENC_PT_panel"
+    bl_label = "Vertex Colors"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.hdr_encode
+
+        layout.operator(HDRENC_OT_create_vcol.bl_idname, icon='ADD')
+
+        col = layout.column(align=True)
+        col.operator(HDRENC_OT_compress_vcol.bl_idname,
+                     icon='FULLSCREEN_EXIT')
+        col.operator(HDRENC_OT_decompress_vcol.bl_idname,
+                     icon='FULLSCREEN_ENTER')
+
+        layout.prop(props, "compression_factor", slider=True)
+
+
 classes = (
     HDRENC_props,
     HDRENC_OT_browse,
     HDRENC_OT_generate,
     HDRENC_OT_batch_convert,
+    HDRENC_OT_create_vcol,
+    HDRENC_OT_compress_vcol,
+    HDRENC_OT_decompress_vcol,
     HDRENC_PT_panel,
     HDRENC_PT_batch,
+    HDRENC_PT_vertex_colors,
 )
 
 
