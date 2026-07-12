@@ -439,8 +439,9 @@ class HDRENC_OT_batch_convert(Operator):
 
 class HDRENC_OT_create_vcol(Operator):
     """Ensure every selected mesh has at least one color attribute
-    (Face Corner domain, Color data type). Meshes that already have
-    one are left untouched"""
+    (Face Corner domain, Color data type), and that one of its color
+    attributes is set active. Meshes that already have a layer keep it,
+    but get an active one assigned if none was set"""
     bl_idname = "hdrenc.create_vcol"
     bl_label = "Create Vertex Color Layer"
     bl_options = {'REGISTER', 'UNDO'}
@@ -453,9 +454,14 @@ class HDRENC_OT_create_vcol(Operator):
     def execute(self, context):
         created = 0
         skipped = 0
+        activated = 0
         for obj, mesh in selected_unique_meshes(context):
             if mesh.color_attributes:
                 skipped += 1
+                if mesh.color_attributes.active_color is None:
+                    mesh.color_attributes.active_color = \
+                        mesh.color_attributes[0]
+                    activated += 1
                 continue
             attr = mesh.color_attributes.new("Color", 'FLOAT_COLOR', 'CORNER')
             mesh.color_attributes.active_color = attr
@@ -464,9 +470,11 @@ class HDRENC_OT_create_vcol(Operator):
         if created == 0 and skipped == 0:
             self.report({'WARNING'}, "No mesh objects selected")
             return {'CANCELLED'}
-        self.report({'INFO'},
-                    "Created a vertex color layer on %d mesh(es); "
-                    "%d already had one" % (created, skipped))
+        msg = ("Created a vertex color layer on %d mesh(es); "
+               "%d already had one" % (created, skipped))
+        if activated:
+            msg += " (%d needed an active layer assigned)" % activated
+        self.report({'INFO'}, msg)
         return {'FINISHED'}
 
 
