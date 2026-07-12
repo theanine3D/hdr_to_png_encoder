@@ -1,7 +1,7 @@
 bl_info = {
     "name": "HDR Encoding Tools",
     "author": "Theanine3D",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (5, 0, 0),
     "location": "UV/Image Editor > Sidebar (N) > HDR Tools",
     "description": "Tools for encoding / compressing HDR images and vertex colors, for use in game engines",
@@ -9,6 +9,7 @@ bl_info = {
 }
 
 import os
+from collections import deque
 
 import bpy
 import numpy as np
@@ -153,6 +154,81 @@ def convert_color_attribute_type(context, obj, data_type):
     return converted
 
 
+def fix_buried_vertices(mesh, attr, threshold):
+    """Replace every buried vertex in a color attribute — one whose RGB
+    channels are all at or below the darkness threshold — with the color
+    of the nearest connected non-buried vertex (breadth-first over mesh
+    edges, so a whole dark patch is filled from its border inward).
+    Works on both Vertex and Face Corner domains; alpha is untouched.
+    Returns (fixed, unreachable) vertex counts."""
+    count = len(attr.data)
+    n_verts = len(mesh.vertices)
+    if count == 0 or n_verts == 0:
+        return 0, 0
+
+    buf = np.empty(count * 4, dtype=np.float32)
+    attr.data.foreach_get("color", buf)
+    rgba = buf.reshape(-1, 4)
+
+    if attr.domain == 'CORNER':
+        loop_v = np.empty(len(mesh.loops), dtype=np.int64)
+        mesh.loops.foreach_get("vertex_index", loop_v)
+        corner_nonblack = rgba[:, :3].max(axis=1) > threshold
+        # A vertex is buried only if every one of its corners is dark.
+        # A non-buried vertex's replacement color averages only its
+        # non-dark corners, so seam vertices don't contribute darkness.
+        col_sum = np.zeros((n_verts, 3), dtype=np.float64)
+        col_cnt = np.zeros(n_verts, dtype=np.int64)
+        np.add.at(col_sum, loop_v[corner_nonblack],
+                  rgba[corner_nonblack, :3])
+        np.add.at(col_cnt, loop_v[corner_nonblack], 1)
+        has_corner = np.zeros(n_verts, dtype=bool)
+        has_corner[loop_v] = True
+        source = col_cnt > 0
+        target = has_corner & ~source
+        vert_color = np.zeros((n_verts, 3), dtype=np.float32)
+        vert_color[source] = (col_sum[source]
+                              / col_cnt[source, None]).astype(np.float32)
+    else:  # 'POINT'
+        vert_color = rgba[:, :3].copy()
+        source = vert_color.max(axis=1) > threshold
+        target = ~source
+
+    if not target.any() or not source.any():
+        return 0, int(np.count_nonzero(target))
+
+    edge_v = np.empty(len(mesh.edges) * 2, dtype=np.int64)
+    mesh.edges.foreach_get("vertices", edge_v)
+    adj = [[] for _ in range(n_verts)]
+    for a, b in edge_v.reshape(-1, 2):
+        adj[a].append(b)
+        adj[b].append(a)
+
+    filled = source.copy()
+    queue = deque(np.flatnonzero(source).tolist())
+    fixed_mask = np.zeros(n_verts, dtype=bool)
+    while queue:
+        v = queue.popleft()
+        for nb in adj[v]:
+            if not filled[nb]:
+                filled[nb] = True
+                vert_color[nb] = vert_color[v]
+                if target[nb]:
+                    fixed_mask[nb] = True
+                queue.append(nb)
+
+    fixed = int(np.count_nonzero(fixed_mask))
+    unreachable = int(np.count_nonzero(target & ~filled))
+    if fixed:
+        if attr.domain == 'CORNER':
+            corner_sel = fixed_mask[loop_v]
+            rgba[corner_sel, :3] = vert_color[loop_v[corner_sel]]
+        else:
+            rgba[fixed_mask, :3] = vert_color[fixed_mask]
+        attr.data.foreach_set("color", buf)
+    return fixed, unreachable
+
+
 class HDRENC_props(PropertyGroup):
     source_path: StringProperty(
         name="Source Image",
@@ -183,6 +259,18 @@ class HDRENC_props(PropertyGroup):
         min=2.0,
         max=6.0,
         default=4.0,
+    )
+    darkness_threshold: FloatProperty(
+        name="Darkness Threshold",
+        description="Vertex colors with all RGB channels at or below "
+                    "this value are treated as buried in the ground and "
+                    "repaired by Fix Buried Vertices",
+        min=0.0,
+        max=1.0,
+        soft_max=0.05,
+        default=0.003,
+        precision=4,
+        step=0.1,
     )
 
 
@@ -459,6 +547,106 @@ class HDRENC_OT_decompress_vcol(Operator):
         return {'FINISHED'}
 
 
+class HDRENC_OT_fix_buried_vcol(Operator):
+    """Fixes the dark shadow bleed caused by vertices that were buried slightly in the ground or inside other objects during the light bake"""
+    bl_idname = "hdrenc.fix_buried_vcol"
+    bl_label = "Fix Buried Vertices"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.mode == 'OBJECT'
+                and any(o.type == 'MESH' for o in context.selected_objects))
+
+    def execute(self, context):
+        threshold = context.scene.hdr_encode.darkness_threshold
+        fixed = 0
+        unreachable = 0
+        meshes = 0
+        for obj, mesh in selected_unique_meshes(context):
+            attr = mesh.color_attributes.active_color
+            if attr is None:
+                continue
+            f, u = fix_buried_vertices(mesh, attr, threshold)
+            mesh.update()
+            meshes += 1
+            fixed += f
+            unreachable += u
+
+        if meshes == 0:
+            self.report({'WARNING'},
+                        "Selected meshes have no color attributes")
+            return {'CANCELLED'}
+        if fixed == 0 and unreachable == 0:
+            self.report({'INFO'},
+                        "No buried vertices found on %d mesh(es) "
+                        "(threshold %.4f)" % (meshes, threshold))
+        elif unreachable:
+            self.report({'WARNING'},
+                        "Fixed %d buried vertex(es) on %d mesh(es); "
+                        "%d left dark (not connected to any vertex "
+                        "above the threshold)"
+                        % (fixed, meshes, unreachable))
+        else:
+            self.report({'INFO'},
+                        "Fixed %d buried vertex(es) on %d mesh(es)"
+                        % (fixed, meshes))
+        return {'FINISHED'}
+
+
+class HDRENC_OT_smooth_vcol(Operator):
+    """Run Blender's built-in Smooth Vertex Colors on the active color
+    attribute of every selected mesh (the built-in operator only works
+    on one object at a time)"""
+    bl_idname = "hdrenc.smooth_vcol"
+    bl_label = "Smooth Vertex Colors"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.mode == 'OBJECT'
+                and any(o.type == 'MESH' for o in context.selected_objects))
+
+    def execute(self, context):
+        view_layer = context.view_layer
+        prev_active = view_layer.objects.active
+        smoothed = 0
+        skipped = 0
+        failed = []
+        try:
+            for obj, mesh in selected_unique_meshes(context):
+                if mesh.color_attributes.active_color is None:
+                    skipped += 1
+                    continue
+                view_layer.objects.active = obj
+                try:
+                    bpy.ops.object.mode_set(mode='VERTEX_PAINT')
+                    try:
+                        bpy.ops.paint.vertex_color_smooth()
+                    finally:
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                    smoothed += 1
+                except RuntimeError as ex:
+                    failed.append(obj.name)
+                    print("HDR Encoding Tools: could not smooth %s: %s"
+                          % (obj.name, ex))
+        finally:
+            view_layer.objects.active = prev_active
+
+        if smoothed == 0 and not failed:
+            self.report({'WARNING'},
+                        "Selected meshes have no color attributes")
+            return {'CANCELLED'}
+        if failed:
+            self.report({'WARNING'},
+                        "Smoothed %d mesh(es); failed on: %s (see console)"
+                        % (smoothed, ", ".join(failed)))
+        else:
+            self.report({'INFO'},
+                        "Smoothed vertex colors on %d mesh(es)" % smoothed)
+        return {'FINISHED'}
+
+
 class HDRENC_PT_panel(Panel):
     bl_idname = "HDRENC_PT_panel"
     bl_space_type = 'IMAGE_EDITOR'
@@ -484,7 +672,7 @@ class HDRENC_PT_batch(Panel):
     bl_idname = "HDRENC_PT_batch"
     bl_space_type = 'IMAGE_EDITOR'
     bl_region_type = 'UI'
-    bl_category = "HDR Encode"
+    bl_category = "HDR Encoding"
     bl_parent_id = "HDRENC_PT_panel"
     bl_label = "Batch"
     bl_options = {'DEFAULT_CLOSED'}
@@ -504,7 +692,7 @@ class HDRENC_PT_vertex_colors(Panel):
     bl_idname = "HDRENC_PT_vertex_colors"
     bl_space_type = 'IMAGE_EDITOR'
     bl_region_type = 'UI'
-    bl_category = "HDR Encode"
+    bl_category = "HDR Encoding"
     bl_parent_id = "HDRENC_PT_panel"
     bl_label = "Vertex Colors"
     bl_options = {'DEFAULT_CLOSED'}
@@ -523,6 +711,14 @@ class HDRENC_PT_vertex_colors(Panel):
 
         layout.prop(props, "compression_factor", slider=True)
 
+        layout.separator()
+        col = layout.column(align=True)
+        col.label(text="Cleanup:")
+        col.prop(props, "darkness_threshold", slider=True)
+        col.operator(HDRENC_OT_fix_buried_vcol.bl_idname,
+                     icon='SHADING_SOLID')
+        col.operator(HDRENC_OT_smooth_vcol.bl_idname, icon='MOD_SMOOTH')
+
 
 classes = (
     HDRENC_props,
@@ -532,6 +728,8 @@ classes = (
     HDRENC_OT_create_vcol,
     HDRENC_OT_compress_vcol,
     HDRENC_OT_decompress_vcol,
+    HDRENC_OT_fix_buried_vcol,
+    HDRENC_OT_smooth_vcol,
     HDRENC_PT_panel,
     HDRENC_PT_batch,
     HDRENC_PT_vertex_colors,
