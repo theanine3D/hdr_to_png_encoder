@@ -155,10 +155,10 @@ def convert_color_attribute_type(context, obj, data_type):
 
 
 def fix_buried_vertices(mesh, attr, threshold):
-    """Replace every buried vertex in a color attribute — one whose RGB
-    channels are all at or below the darkness threshold — with the color
-    of the nearest connected non-buried vertex (breadth-first over mesh
-    edges, so a whole dark patch is filled from its border inward).
+    """Replace the color of every buried vertex — one whose RGB channels
+    are all at or below the darkness threshold — with the color of the
+    nearest connected non-buried vertex (breadth-first over mesh edges,
+    so a whole dark patch is filled from its border inward).
     Works on both Vertex and Face Corner domains; alpha is untouched.
     Returns (fixed, unreachable) vertex counts."""
     count = len(attr.data)
