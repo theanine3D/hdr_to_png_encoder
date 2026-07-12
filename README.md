@@ -25,6 +25,8 @@ For .HDR and .EXR image encoding:
 - After a moment, your new PNG will appear in the UV/Image Editor automatically.
 - No need to save the new image manually - the addon also saves it the same folder as your chosen .EXR/HDR image.
 
+The Batch feature will encode an entire folder of HDR images, instead of working on a single image at a time.
+
 ### Encodings
 
 Both PNG encodings store gamma-encoded (1/2.2) values, following Unity's
