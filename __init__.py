@@ -1,7 +1,7 @@
 bl_info = {
     "name": "HDR Encoding Tools",
     "author": "Theanine3D",
-    "version": (1, 3, 0),
+    "version": (1, 0, 0),
     "blender": (5, 0, 0),
     "location": "UV/Image Editor > Sidebar (N) > HDR Encoding (image tools); 3D Viewport > Sidebar (N) > HDR Encoding (vertex color tools)",
     "description": "Tools for encoding / compressing HDR images and vertex colors, for use in game engines",
@@ -251,10 +251,7 @@ def fix_buried_vertices(mesh, attr, threshold):
 
 
 def find_buried_islands(mesh, attr, threshold):
-    """Find the vertices Fix Buried Vertices cannot repair: whole
-    geometry islands where no vertex rises above the darkness threshold,
-    so there is no brighter vertex to copy a color from.
-    Returns (vertex mask, island count)."""
+    """Find pieces of geometry that were completely buried (aka completely darkened by shadows)."""
     n_verts = len(mesh.vertices)
     state = burial_state(mesh, attr, threshold)
     if state is None:
@@ -512,15 +509,35 @@ class HDRENC_props(PropertyGroup):
     )
     darkness_threshold: FloatProperty(
         name="Darkness Threshold",
-        description="Vertex colors with all RGB channels at or below "
-                    "this value are treated as buried in the ground and "
-                    "repaired by Fix Buried Vertices",
+        description="A higher value will lighten a greater surface area of"
+        "the mesh. A lower value will only lighten the absolute darkest parts"
+        "of the mesh. Default value should work in most cases",
         min=0.0,
         max=1.0,
         soft_max=0.05,
         default=0.003,
         precision=4,
         step=0.1,
+    )
+    direction_similarity: FloatProperty(
+        name="Direction Similarity",
+        description="If 'Sample from Other Islands' is enabled, this "
+                    "setting is used to determine how similar the "
+                    "direction of nearby faces must be in order for"
+                    "their color to be copied to any buried vertices",
+        min=0.0,
+        max=100.0,
+        default=99.0,
+        subtype='PERCENTAGE',
+        precision=1,
+    )
+    sample_from_other_islands: BoolProperty(
+        name="Sample from Other Islands",
+        description="When parts of the mesh are completely buried, this "
+                    "setting will force the 'Fix Buried Vertices' button "
+                    "to sample nearby (unburied) faces and copy their color"
+                    "to the completley buried islands"
+        default=False,
     )
 
 
@@ -806,10 +823,7 @@ class HDRENC_OT_decompress_vcol(Operator):
 
 
 class HDRENC_OT_find_buried_islands(Operator):
-    """Select every geometry island that is 100% buried — no vertex in
-    it above the Darkness Threshold — and switch to Edit Mode so the
-    islands are highlighted. These are the islands Fix Buried Vertices
-    cannot repair, because there is no brighter vertex to copy from"""
+    """Find and highlight every geometry island that is 100% buried, and completely darkened by shadow as a result"""
     bl_idname = "hdrenc.find_buried_islands"
     bl_label = "Find Buried Islands"
     bl_options = {'REGISTER', 'UNDO'}
@@ -873,35 +887,16 @@ class HDRENC_OT_fix_buried_vcol(Operator):
     bl_label = "Fix Buried Vertices"
     bl_options = {'REGISTER', 'UNDO'}
 
-    sample_from_other_islands: BoolProperty(
-        name="Sample from Other Islands",
-        description="For geometry islands that are 100% buried (no "
-                    "vertex above the Darkness Threshold to copy from, "
-                    "so they'd otherwise be left dark), copy colors "
-                    "from the nearest face on a different island whose "
-                    "normal points in a similar direction",
-        default=False,
-    )
-    normal_similarity: FloatProperty(
-        name="Normal Similarity",
-        description="How closely a donor face's normal must match the "
-                    "buried face's normal to be used, for Sample from "
-                    "Other Islands (100% = facing exactly the same "
-                    "direction)",
-        min=0.0,
-        max=100.0,
-        default=99.0,
-        subtype='PERCENTAGE',
-        precision=1,
-    )
-
     @classmethod
     def poll(cls, context):
         return (context.mode == 'OBJECT'
                 and any(o.type == 'MESH' for o in context.selected_objects))
 
     def execute(self, context):
-        threshold = context.scene.hdr_encode.darkness_threshold
+        props = context.scene.hdr_encode
+        threshold = props.darkness_threshold
+        sample_other_islands = props.sample_from_other_islands
+        min_similarity = props.direction_similarity / 100.0
         fixed = 0
         unreachable = 0
         sampled = 0
@@ -914,9 +909,9 @@ class HDRENC_OT_fix_buried_vcol(Operator):
             meshes += 1
             fixed += f
             unreachable += u
-            if self.sample_from_other_islands and u:
+            if sample_other_islands and u:
                 sampled += sample_buried_islands_from_other_islands(
-                    mesh, attr, threshold, self.normal_similarity / 100.0)
+                    mesh, attr, threshold, min_similarity)
             mesh.update()
 
         if meshes == 0:
@@ -928,7 +923,7 @@ class HDRENC_OT_fix_buried_vcol(Operator):
             self.report({'INFO'},
                         "No buried vertices found on %d mesh(es) "
                         "(threshold %.4f)" % (meshes, threshold))
-        elif not self.sample_from_other_islands:
+        elif not sample_other_islands:
             if unreachable:
                 self.report({'WARNING'},
                             "Fixed %d buried vertex(es) on %d mesh(es); "
@@ -1070,12 +1065,17 @@ class HDRENC_PT_vertex_colors(Panel):
         layout.separator()
         col = layout.column(align=True)
         col.label(text="Cleanup:")
-        col.prop(props, "darkness_threshold", slider=True)
         col.operator(HDRENC_OT_find_buried_islands.bl_idname,
                      icon='VIEWZOOM')
-        col.operator(HDRENC_OT_fix_buried_vcol.bl_idname,
-                     icon='SHADING_SOLID')
-        col.operator(HDRENC_OT_smooth_vcol.bl_idname, icon='MOD_SMOOTH')
+
+        col2 = layout.column(align=True)
+        col2.prop(props, "darkness_threshold", slider=True)
+        col2.prop(props, "direction_similarity", slider=True)
+        col2.prop(props, "sample_from_other_islands")
+        col2.operator(HDRENC_OT_fix_buried_vcol.bl_idname,
+                      icon='SHADING_SOLID')
+
+        layout.operator(HDRENC_OT_smooth_vcol.bl_idname, icon='MOD_SMOOTH')
 
 
 classes = (
