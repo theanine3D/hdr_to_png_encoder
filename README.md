@@ -78,26 +78,13 @@ values in Blender. Alpha is never scaled — only RGB.
 HDR Encoding Tools also has some cleanup features for light that was baked to
 vertex colors. 
 
-- **Fix Buried Vertices** — repairs "shadow bleed": if vertices at the
-  base of a mesh poke even slightly below the ground, they bake to
-  black or near-black, and interpolation then smears that darkness up
-  the sides of the mesh. This button finds every buried vertex — one
-  whose RGB channels are all at or below the **Darkness Threshold**
-  (default 0.003) — and copies the color of the nearest connected
-  non-buried vertex, searching outward through connected vertices until
-  it finds one above the threshold. Raise the threshold if your buried
-  vertices bake slightly brighter than that; lower it if legitimate
-  dark areas are being caught. Works on both Vertex and Face Corner
-  domains; alpha is never touched. Vertices in a fully dark
-  disconnected island (no bright vertex to reach) are left as-is and
-  counted in the report.
-- **Find Buried Islands** — selects the geometry that Fix Buried
-  Vertices can't repair: whole islands where every vertex is at or
-  below the Darkness Threshold, so there's no brighter vertex to copy a
-  color from. After marking the islands as selected, it switches to
-  Edit Mode automatically so they're immediately highlighted, ready to
-  be dealt with manually (moved above ground and re-baked, deleted, or
-  painted by hand).
+- **Fix Buried Vertices** — repairs "shadow bleed": if vertices in a mesh
+- are buried even slightly inside other geometry, the light value there bakes
+  to black or near-black, and interpolation then smears that darkness up
+  the sides of the mesh. This button fixes that by copying the nearest
+  non-black color to those vertices that were completely buried.
+- **Find Buried Islands** — finds and highlights geometry islands that are
+- completely buried - and as a result, completely darkened by shadows
 - **Smooth Vertex Colors** — runs Blender's built-in Smooth Vertex
   Colors feature (from Vertex Color Paint mode) in batch mode on every
   selected mesh in one click.
