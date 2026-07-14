@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "hdr_encoding_tools"
-version = "1.2.0"
+version = "1.0.0"
 name = "HDR Encoding Tools"
 tagline = "Tools for encoding/compressing HDR images & vertex colors"
 maintainer = "Theanine3D <theanine3d@gmail.com>"
