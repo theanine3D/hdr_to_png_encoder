@@ -536,7 +536,7 @@ class HDRENC_props(PropertyGroup):
         description="When parts of the mesh are completely buried, this "
                     "setting will force the 'Fix Buried Vertices' button "
                     "to sample nearby (unburied) faces and copy their color"
-                    "to the completley buried islands"
+                    "to the completley buried islands",
         default=False,
     )
 
