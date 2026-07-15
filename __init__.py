@@ -127,11 +127,13 @@ def scale_color_attribute(attr, factor):
 def convert_color_attribute_type(context, obj, data_type):
     """Convert every color attribute on obj's mesh to Face Corner domain
     and the given data type. Domain is always forced to Face Corner
-    (Unity's FBX import expects it); only the data type toggles between
-    compress and decompress. Returns the number of layers now in that
-    format."""
+    (Unity's FBX import expects it). Returns the number of layers now in
+    that format."""
     mesh = obj.data
     names = [a.name for a in mesh.color_attributes]
+    prev_active_attr = mesh.color_attributes.active_color
+    prev_active_name = (prev_active_attr.name
+                        if prev_active_attr is not None else None)
     converted = 0
     view_layer = context.view_layer
     prev_active = view_layer.objects.active
@@ -150,6 +152,10 @@ def convert_color_attribute_type(context, obj, data_type):
                 domain='CORNER', data_type=data_type)
             converted += 1
     finally:
+        if prev_active_name is not None:
+            idx = mesh.color_attributes.find(prev_active_name)
+            if idx >= 0:
+                mesh.color_attributes.active_color_index = idx
         view_layer.objects.active = prev_active
     return converted
 
