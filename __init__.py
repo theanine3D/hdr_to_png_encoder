@@ -127,8 +127,11 @@ def scale_color_attribute(attr, factor):
 def convert_color_attribute_type(context, obj, data_type):
     """Convert every color attribute on obj's mesh to Face Corner domain
     and the given data type. Domain is always forced to Face Corner
-    (Unity's FBX import expects it). Returns the number of layers now in
-    that format."""
+    (Unity's FBX import expects it); only the data type toggles between
+    compress and decompress. The mesh's active color slot is preserved
+    (the convert operator works on the active slot, so the loop has to
+    cycle it - by name, since conversion recreates the attributes).
+    Returns the number of layers now in that format."""
     mesh = obj.data
     names = [a.name for a in mesh.color_attributes]
     prev_active_attr = mesh.color_attributes.active_color
@@ -462,24 +465,67 @@ def select_only_vertices(mesh, vert_mask):
     mesh.update()
 
 
-def ensure_safe_vertex_paint_tool(context):
-    """Guard against a Blender tool-system crash on entering Vertex
-    Paint mode: if the workspace's saved Vertex Paint tool references a
-    brush_type no longer valid in this Blender version (e.g. a stale
-    'Blur' reference left over from an older Blender install), Blender's
-    automatic tool restoration throws an unhandled exception that it
-    prints to the console (the mode switch itself still succeeds -
-    Blender just swallows the error internally). Pointing the tool at
-    a known-good brush first avoids tripping over the bad reference.
-    Best-effort: if this Blender version's tool API differs, this
-    quietly does nothing and mode_set proceeds exactly as before."""
-    try:
-        tool = context.workspace.tools.from_space_view3d_mode(
-            'PAINT_VERTEX', create=True)
-        if tool is not None:
-            tool.idname = 'builtin_brush.Draw'
-    except Exception:
-        pass
+def smooth_color_attribute(mesh, attr):
+    """One pass of neighbour-averaging (Laplacian) smoothing on a color
+    attribute: each vertex's RGB becomes the mean of its own color and
+    the colors of its edge-connected neighbours. Alpha is untouched.
+    Works on both Vertex and Face Corner domains - corner colors are
+    reduced to one color per vertex, smoothed, then written back to
+    every corner of that vertex, matching the built-in Smooth Vertex
+    Colors for the continuous per-vertex colors this is used on. Runs
+    entirely on mesh data with no mode switch (so it never depends on
+    Vertex Paint mode being initialised). Returns True if colors were
+    written."""
+    count = len(attr.data)
+    n_verts = len(mesh.vertices)
+    if count == 0 or n_verts == 0:
+        return False
+
+    buf = np.empty(count * 4, dtype=np.float32)
+    attr.data.foreach_get("color", buf)
+    rgba = buf.reshape(-1, 4)
+
+    if attr.domain == 'CORNER':
+        loop_v = np.empty(len(mesh.loops), dtype=np.int64)
+        mesh.loops.foreach_get("vertex_index", loop_v)
+        vsum = np.zeros((n_verts, 3), dtype=np.float64)
+        vcnt = np.zeros(n_verts, dtype=np.int64)
+        np.add.at(vsum, loop_v, rgba[:, :3])
+        np.add.at(vcnt, loop_v, 1)
+        has = vcnt > 0
+        vcol = np.zeros((n_verts, 3), dtype=np.float64)
+        vcol[has] = vsum[has] / vcnt[has, None]
+    else:  # 'POINT'
+        loop_v = None
+        vcol = rgba[:, :3].astype(np.float64)
+        has = np.ones(n_verts, dtype=bool)
+
+    # Neighbour sums over edges, each vertex seeded with its own color.
+    # A neighbour only contributes if it actually carries color data, so
+    # loose/colorless vertices can't pull a color toward black.
+    nsum = np.where(has[:, None], vcol, 0.0)
+    ncnt = has.astype(np.int64)
+    edge_v = np.empty(len(mesh.edges) * 2, dtype=np.int64)
+    mesh.edges.foreach_get("vertices", edge_v)
+    a = edge_v.reshape(-1, 2)[:, 0]
+    b = edge_v.reshape(-1, 2)[:, 1]
+    contrib_a = has[b]  # b lends its color to a
+    np.add.at(nsum, a[contrib_a], vcol[b[contrib_a]])
+    np.add.at(ncnt, a[contrib_a], 1)
+    contrib_b = has[a]  # a lends its color to b
+    np.add.at(nsum, b[contrib_b], vcol[a[contrib_b]])
+    np.add.at(ncnt, b[contrib_b], 1)
+
+    smoothed = vcol.copy()
+    ok = ncnt > 0
+    smoothed[ok] = nsum[ok] / ncnt[ok, None]
+
+    if attr.domain == 'CORNER':
+        rgba[:, :3] = smoothed[loop_v].astype(np.float32)
+    else:
+        rgba[:, :3] = smoothed.astype(np.float32)
+    attr.data.foreach_set("color", buf)
+    return True
 
 
 class HDRENC_props(PropertyGroup):
@@ -955,7 +1001,7 @@ class HDRENC_OT_fix_buried_vcol(Operator):
 
 
 class HDRENC_OT_smooth_vcol(Operator):
-    """Run Blender's built-in 'Smooth Vertex Colors' feature in batch mode - on all selected mesh objects. Only the active color attribute of each mesh is affected"""
+    """Smooth (blur) the active color attribute of every selected mesh - each vertex's color is averaged with its connected neighbours. Runs in Object Mode; press repeatedly for a stronger effect"""
     bl_idname = "hdrenc.smooth_vcol"
     bl_label = "Smooth Vertex Colors"
     bl_options = {'REGISTER', 'UNDO'}
@@ -966,43 +1012,21 @@ class HDRENC_OT_smooth_vcol(Operator):
                 and any(o.type == 'MESH' for o in context.selected_objects))
 
     def execute(self, context):
-        ensure_safe_vertex_paint_tool(context)
-        view_layer = context.view_layer
-        prev_active = view_layer.objects.active
         smoothed = 0
-        skipped = 0
-        failed = []
-        try:
-            for obj, mesh in selected_unique_meshes(context):
-                if mesh.color_attributes.active_color is None:
-                    skipped += 1
-                    continue
-                view_layer.objects.active = obj
-                try:
-                    bpy.ops.object.mode_set(mode='VERTEX_PAINT')
-                    try:
-                        bpy.ops.paint.vertex_color_smooth()
-                    finally:
-                        bpy.ops.object.mode_set(mode='OBJECT')
-                    smoothed += 1
-                except RuntimeError as ex:
-                    failed.append(obj.name)
-                    print("HDR Encoding Tools: could not smooth %s: %s"
-                          % (obj.name, ex))
-        finally:
-            view_layer.objects.active = prev_active
+        for obj, mesh in selected_unique_meshes(context):
+            attr = mesh.color_attributes.active_color
+            if attr is None:
+                continue
+            if smooth_color_attribute(mesh, attr):
+                mesh.update()
+                smoothed += 1
 
-        if smoothed == 0 and not failed:
+        if smoothed == 0:
             self.report({'WARNING'},
                         "Selected meshes have no color attributes")
             return {'CANCELLED'}
-        if failed:
-            self.report({'WARNING'},
-                        "Smoothed %d mesh(es); failed on: %s (see console)"
-                        % (smoothed, ", ".join(failed)))
-        else:
-            self.report({'INFO'},
-                        "Smoothed vertex colors on %d mesh(es)" % smoothed)
+        self.report({'INFO'},
+                    "Smoothed vertex colors on %d mesh(es)" % smoothed)
         return {'FINISHED'}
 
 
