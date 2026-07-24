@@ -72,6 +72,32 @@ Keep the compressed values if you plan to re-export; use **Decompress
 and Restore HDR** when you want to preview or re-bake the true HDR
 values in Blender. Alpha is never scaled — only RGB.
 
+### Transparency
+
+Baking light onto a mesh with a transparent texture (foliage, leaves,
+fences, etc.) is a problem: the transparent parts of the surface have no
+light, so they bake to black, and that black then bleeds across the mesh
+through vertex-color interpolation — often turning whole meshes dark. The
+**Transparency** section automates the usual workaround of making the
+material temporarily opaque for the bake:
+
+- **Bake Color** — the solid Base Color transparent materials are set to
+  during the bake (default green, which suits plants). Set it to whatever
+  best matches the meshes you're baking.
+- **Unplug for Bake** — on every *transparent* material of the selected
+  meshes (Principled BSDF with a linked or below-1.0 Alpha), disconnects
+  the Base Color and Alpha inputs and sets them to the Bake Color and
+  fully opaque. Fully opaque materials are left alone. Bake your lighting
+  now.
+- **Restore Connections** — reconnects the Base Color and Alpha inputs
+  exactly as they were, restoring the original albedo and transparency.
+
+The original links and values are stored on the material nodes
+themselves, so Restore works reliably even after saving and reopening the
+file. Shared materials are handled once. Only Principled BSDF Alpha is
+covered — Mix-Shader / Transparent-BSDF transparency setups aren't
+touched.
+
 ### Cleanup
 
 HDR Encoding Tools also has some cleanup features for light that was baked to
